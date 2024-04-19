@@ -32,12 +32,16 @@ except ImportError:
 
 import numpy as np
 import torch
+if torch.__version__ >= '1.8':
+    import torch_npu
+
 import torch.distributed as dist
 import torch.nn as nn
 import yaml
 from torch.optim import lr_scheduler
 from tqdm import tqdm
-
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
@@ -170,7 +174,7 @@ def train(hyp, opt, device, callbacks):
 
     # Config
     plots = not evolve and not opt.noplots  # create plots
-    cuda = device.type != "cpu"
+    npu = device.type != "cpu"
     init_seeds(opt.seed + 1 + RANK, deterministic=True)
     with torch_distributed_zero_first(LOCAL_RANK):
         data_dict = data_dict or check_dataset(data)  # check if None
@@ -238,15 +242,15 @@ def train(hyp, opt, device, callbacks):
         del ckpt, csd
 
     # DP mode
-    if cuda and RANK == -1 and torch.cuda.device_count() > 1:
-        LOGGER.warning(
-            "WARNING ⚠️ DP not recommended, use torch.distributed.run for best DDP Multi-GPU results.\n"
-            "See Multi-GPU Tutorial at https://docs.ultralytics.com/yolov5/tutorials/multi_gpu_training to get started."
-        )
-        model = torch.nn.DataParallel(model)
+    # if npu and RANK == -1 and torch.npu.device_count() > 1:
+    #     LOGGER.warning(
+    #         "WARNING ⚠️ DP not recommended, use torch.distributed.run for best DDP Multi-GPU results.\n"
+    #         "See Multi-GPU Tutorial at https://docs.ultralytics.com/yolov5/tutorials/multi_gpu_training to get started."
+    #     )
+    #     model = torch.nn.DataParallel(model)
 
     # SyncBatchNorm
-    if opt.sync_bn and cuda and RANK != -1:
+    if opt.sync_bn and npu and RANK != -1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         LOGGER.info("Using SyncBatchNorm()")
 
@@ -298,7 +302,7 @@ def train(hyp, opt, device, callbacks):
         callbacks.run("on_pretrain_routine_end", labels, names)
 
     # DDP mode
-    if cuda and RANK != -1:
+    if npu and RANK != -1:
         model = smart_DDP(model)
 
     # Model attributes
@@ -321,7 +325,7 @@ def train(hyp, opt, device, callbacks):
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    scaler = torch.npu.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
     compute_loss = ComputeLoss(model)  # init loss class
     callbacks.run("on_train_start")
@@ -378,7 +382,7 @@ def train(hyp, opt, device, callbacks):
                     imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
 
             # Forward
-            with torch.cuda.amp.autocast(amp):
+            with torch.npu.amp.autocast(amp):
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
@@ -403,7 +407,7 @@ def train(hyp, opt, device, callbacks):
             # Log
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
-                mem = f"{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G"  # (GB)
+                mem = f"{torch.npu.memory_reserved() / 1E9 if torch.npu.is_available() else 0:.3g}G"  # (GB)
                 pbar.set_description(
                     ("%11s" * 2 + "%11.4g" * 5)
                     % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], imgs.shape[-1])
@@ -506,7 +510,7 @@ def train(hyp, opt, device, callbacks):
 
         callbacks.run("on_train_end", last, best, epoch, results)
 
-    torch.cuda.empty_cache()
+    torch.npu.empty_cache()
     return results
 
 
@@ -604,19 +608,20 @@ def main(opt, callbacks=Callbacks()):
         opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
 
     # DDP mode
-    device = select_device(opt.device, batch_size=opt.batch_size)
+    # device = select_device(opt.device, batch_size=opt.batch_size)
     if LOCAL_RANK != -1:
         msg = "is not compatible with YOLOv5 Multi-GPU DDP training"
         assert not opt.image_weights, f"--image-weights {msg}"
         assert not opt.evolve, f"--evolve {msg}"
         assert opt.batch_size != -1, f"AutoBatch with --batch-size -1 {msg}, please pass a valid --batch-size"
         assert opt.batch_size % WORLD_SIZE == 0, f"--batch-size {opt.batch_size} must be multiple of WORLD_SIZE"
-        assert torch.cuda.device_count() > LOCAL_RANK, "insufficient CUDA devices for DDP command"
-        torch.cuda.set_device(LOCAL_RANK)
-        device = torch.device("cuda", LOCAL_RANK)
-        dist.init_process_group(
-            backend="nccl" if dist.is_nccl_available() else "gloo", timeout=timedelta(seconds=10800)
-        )
+        assert torch.npu.device_count() > LOCAL_RANK, "insufficient CUDA devices for DDP command"
+        torch.npu.set_device(LOCAL_RANK)
+        device = torch.device("npu", LOCAL_RANK)
+        dist.init_process_group(backend="hccl", world_size=WORLD_SIZE, rank=RANK)
+    else:
+        torch.npu.set_device(int(opt.device))
+        device = torch.device('npu', int(opt.device))
 
     # Train
     if not opt.evolve:

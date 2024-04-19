@@ -28,6 +28,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch
+if torch.__version__ >= '1.8':
+    import torch_npu
 from tqdm import tqdm
 
 FILE = Path(__file__).resolve()
@@ -155,7 +158,9 @@ def run(
         half &= device.type != "cpu"  # half precision only supported on CUDA
         model.half() if half else model.float()
     else:  # called directly
-        device = select_device(device, batch_size=batch_size)
+        # device = select_device(device, batch_size=batch_size)
+        torch.npu.set_device(int(device))
+        device = torch.device('npu', int(device))
 
         # Directories
         save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
